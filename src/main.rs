@@ -222,6 +222,8 @@ struct RenameApp {
     preview_filter: Option<PreviewStatus>,
     /// 清单映射查看窗口（存规则序号，None=关闭）
     mapping_view: Option<usize>,
+    /// 预览统计信息（共 x 节点 | 可改名 x ...），显示在顶部面板
+    preview_stats: String,
     status_msg: String,
     undo: UndoManager,
     /// 截图钩子（仅供验收）：PR_CAPTURE 指向输出路径时，启动后自截图一帧 BMP 并退出
@@ -260,6 +262,7 @@ impl RenameApp {
             preview_zoom: 1.0,
             preview_filter: None,
             mapping_view: None,
+            preview_stats: String::new(),
             status_msg: String::new(),
             undo: UndoManager::new(),
             capture_path,
@@ -342,9 +345,10 @@ impl RenameApp {
             stack2.extend(n.children.iter());
         }
         let skipped = node_count.saturating_sub(total);
-        self.status_msg = format!(
+        self.preview_stats = format!(
             "共 {node_count} 个节点 | 可改名 {total} | 将重命名 {ok} | 冲突 {conflict} | 错误 {error} | 无变化 {unchanged} | 跳过 {skipped}"
         );
+        // 注意：不再写 status_msg，避免覆盖「改名成功/撤销」等操作反馈
     }
 
     fn apply(&mut self) {
@@ -536,6 +540,12 @@ impl eframe::App for RenameApp {
                     self.reload();
                 }
             });
+            // 预览统计信息（共 x 节点 | 可改名 x ...），弱化显示不抢顶部操作区视觉
+            if !self.preview_stats.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&self.preview_stats).weak());
+                });
+            }
         });
 
         // 底部状态栏（应用/撤销按钮已移至规则面板）
