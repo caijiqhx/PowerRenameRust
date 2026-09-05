@@ -1101,6 +1101,147 @@ impl eframe::App for RenameApp {
     }
 }
 
+/// 一个字符级变更片段（LCS diff 结果）。
+enum DiffKind {
+    Equal,
+    Del,
+    Ins,
+}
+
+/// 字符级 diff：返回两个字符串的等长标记序列（diff 编辑脚本，按 char 处理，
+/// 保证中文/emoji 等 UTF-8 多字节字符不被切碎）。
+fn diff_chars(old: &str, new: &str) -> Vec<(DiffKind, char)> {
+    let a: Vec<char> = old.chars().collect();
+    let b: Vec<char> = new.chars().collect();
+    let n = a.len();
+    let m = b.len();
+    // LCS 动态规划表（n*m 小，文件名长度可忽略性能）
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i * (m + 1) + j] = if a[i] == b[j] {
+                dp[(i + 1) * (m + 1) + j + 1] + 1
+            } else {
+                dp[(i + 1) * (m + 1) + j].max(dp[i * (m + 1) + j + 1])
+            };
+        }
+    }
+    // 回溯编辑脚本
+    let mut ops = Vec::with_capacity(n + m);
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push((DiffKind::Equal, a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1] {
+            ops.push((DiffKind::Del, a[i]));
+            i += 1;
+        } else {
+            ops.push((DiffKind::Ins, b[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push((DiffKind::Del, a[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push((DiffKind::Ins, b[j]));
+        j += 1;
+    }
+    ops
+}
+
+/// 生成 diff 高亮 LayoutJob：旧名删除段红色+删除线，新名新增段绿色、保留段默认色。
+/// 只有 old != new 时高亮（无变化/跳过行走普通 label，避免渲染噪音）。
+fn diff_layout_job(old: &str, new: &str) -> Option<egui::text::LayoutJob> {
+    if old == new {
+        return None;
+    }
+    let mut job = egui::text::LayoutJob::default();
+    for (kind, c) in diff_chars(old, new) {
+        let text = c.to_string();
+        let fmt = match kind {
+            DiffKind::Equal => egui::TextFormat::default(),
+            DiffKind::Del => egui::TextFormat {
+                color: egui::Color32::from_rgb(0xcc, 0x4a, 0x4a),
+                strikethrough: egui::Stroke::new(1.0, egui::Color32::from_rgb(0xcc, 0x4a, 0x4a)),
+                ..Default::default()
+            },
+            DiffKind::Ins => egui::TextFormat {
+                color: egui::Color32::from_rgb(0x2e, 0x8b, 0x57),
+                background: egui::Color32::from_rgb(0xdc, 0xf0, 0xe2),
+                ..Default::default()
+            },
+        };
+        job.append(&text, 0.0, fmt);
+    }
+    Some(job)
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::{diff_chars, DiffKind};
+
+    fn kinds(ops: &[(DiffKind, char)]) -> Vec<DiffKind> {
+        ops.iter().map(|(k, _)| match k {
+            DiffKind::Equal => DiffKind::Equal,
+            DiffKind::Del => DiffKind::Del,
+            DiffKind::Ins => DiffKind::Ins,
+        }).collect()
+    }
+    fn text(ops: &[(DiffKind, char)]) -> String {
+        ops.iter().map(|(_, c)| *c).collect()
+    }
+
+    #[test]
+    fn unchanged_yields_only_equal() {
+        let ops = diff_chars("abc", "abc");
+        assert!(kinds(&ops).iter().all(|k| matches!(k, DiffKind::Equal)));
+        assert_eq!(text(&ops), "abc");
+    }
+
+    #[test]
+    fn append_highlighted_as_insert() {
+        // report.txt -> report 2026.txt：新名有插入段（可能在中部，因 .txt 是公共后缀）
+        let ops = diff_chars("report.txt", "report 2026.txt");
+        let old_repro: String = ops
+            .iter()
+            .filter(|(k, _)| matches!(k, DiffKind::Equal | DiffKind::Del))
+            .map(|(_, c)| *c)
+            .collect();
+        let new_repro: String = ops
+            .iter()
+            .filter(|(k, _)| matches!(k, DiffKind::Equal | DiffKind::Ins))
+            .map(|(_, c)| *c)
+            .collect();
+        assert_eq!(old_repro, "report.txt");
+        assert_eq!(new_repro, "report 2026.txt");
+        assert!(ops.iter().any(|(k, _)| matches!(k, DiffKind::Ins)), "应有插入段");
+        // 注：追加场景旧名整体保留（LCS=整个旧名），不一定有删除段；
+        // 删除/替换场景由 removal_highlighted_as_delete 和 unchanged 覆盖
+    }
+
+    #[test]
+    fn removal_highlighted_as_delete() {
+        let ops = diff_chars("old_report.txt", "report.txt");
+        let ks = kinds(&ops);
+        assert!(ks.iter().any(|k| matches!(k, DiffKind::Del)));
+    }
+
+    #[test]
+    fn unicode_not_split() {
+        // 中文字符按 char 参与 diff，不会被拆散成半个字符
+        let ops = diff_chars("文件.txt", "文件-备份.txt");
+        assert_eq!(text(&ops), "文件-备份.txt"); // 拼接后仍是完整新名
+        for (_, c) in &ops {
+            // 不出现孤立 UTF-8 残片：中文都是合法 char
+            assert!(!c.is_control());
+        }
+    }
+}
+
 /// 递归把树渲染进表格 body。
 ///
 /// 目录行：第一列显示缩进 + painter 绘制的折叠三角 + 名字；
@@ -1248,7 +1389,11 @@ fn render_tree_rows(
                 // 目录新名称（参与改名时显示）
                 paint_row_hover(ui, is_selected);
                 if !is_dir_skipped {
-                    ui.colored_label(dir_color, dir_new_name);
+                    if let Some(job) = diff_layout_job(&node.name, &dir_new_name) {
+                        ui.label(job);
+                    } else {
+                        ui.colored_label(dir_color, dir_new_name);
+                    }
                 }
             });
             row.col(|ui| {
@@ -1333,7 +1478,11 @@ fn render_tree_rows(
         row.col(|ui| {
             paint_row_hover(ui, is_selected);
             if !is_skipped {
-                ui.colored_label(color, new_name);
+                if let Some(job) = diff_layout_job(&node.name, &new_name) {
+                    ui.label(job);
+                } else {
+                    ui.colored_label(color, new_name);
+                }
             }
         });
         row.col(|ui| {
