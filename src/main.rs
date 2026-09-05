@@ -1356,11 +1356,9 @@ fn panel_frame() -> egui::Frame {
 fn install_chinese_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 内嵌的 gzip 压缩字体（编译期嵌入 exe）
-    let compressed: &[u8] = include_bytes!("../assets/fonts/wqy-microhei.ttc.gz");
-
-    // 解压 gzip → 原始 .ttc 字节
-    let installed = {
+    // 内嵌的 gzip 压缩子集字体（GB2312 全量 6763 汉字 + ASCII + 常用符号，~680KB gz）
+    let compressed: &[u8] = include_bytes!("../assets/fonts/wqy-microhei-subset.ttf.gz");
+    let embedded_ok = {
         use std::io::Read;
         let mut decoder = flate2::read::GzDecoder::new(compressed);
         let mut bytes: Vec<u8> = Vec::with_capacity(compressed.len() * 2);
@@ -1372,24 +1370,62 @@ fn install_chinese_font(ctx: &egui::Context) {
             false
         }
     };
-
-    // 字体缺失：这里必须显式返回并提示，否则界面无字形
-    if !installed {
-        eprintln!("[PowerRename] 内嵌字体解压失败，界面将无法正常显示文本");
-        return;
+    if embedded_ok {
+        // 内嵌子集作为比例/等宽字体的首选字形
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "main".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "main".to_owned());
+    } else {
+        eprintln!("[PowerRename] 内嵌子集字体解压失败，仅回退系统字体");
     }
 
-    // 主字体同时作为比例/等宽字体的首个 fallback（英文由中文文档字体覆盖）
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "main".to_owned());
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .insert(0, "main".to_owned());
+    // 系统 CJK 字体作为 fallback：覆盖子集未收录的生僻字（不依赖子集嵌入则作为主力）
+    const SYSTEM_FONT_CANDIDATES: &[&str] = &[
+        // Windows 微软雅黑/黑体/宋体/等线
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttf",
+        "C:\\Windows\\Fonts\\msyhbd.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+        "C:\\Windows\\Fonts\\Deng.ttf",
+        // macOS 苹方/华文黑体/宋体
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        // Linux 思源黑体/文泉驿/Droid
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+    for path in SYSTEM_FONT_CANDIDATES {
+        if let Ok(bytes) = std::fs::read(path) {
+            let font_data = egui::FontData::from_owned(bytes);
+            fonts.font_data.insert("sys_cjk".to_owned(), font_data.into());
+            // 排在主字体之后（内嵌失败则排首位），egui 按数组顺序查字形
+            let idx = if embedded_ok { 1 } else { 0 };
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(idx, "sys_cjk".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(idx, "sys_cjk".to_owned());
+            break;
+        }
+    }
 
     ctx.set_fonts(fonts);
 }
