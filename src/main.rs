@@ -1338,77 +1338,44 @@ fn panel_frame() -> egui::Frame {
         .corner_radius(egui::CornerRadius::same(0))
 }
 
-/// 安装中文字体（egui 默认字体不含中文，需加载系统字体，否则中文显示为乱码/方框）。
+/// 安装中文字体（egui 默认字体不含中文，需加载字体，否则中文显示为乱码/方框）。
 ///
 /// 为什么 tkinter 没这问题：tkinter 不嵌入字体，直接用系统字体渲染文本；
 /// egui 用内置字形图集（glyph atlas）绘制所有文本，必须把字体文件读进内存，
 /// 否则非 English 字符（中文等）无字形可画 → 方框/乱码。
 ///
-/// 跨平台：按当前系统加载字体文件。各平台中文字体路径：
-/// - Windows: msyh(微软雅黑) / simhei(黑体) / simsun(宋体)
-/// - macOS:   PingFang / Hiragino Sans GB / STHeiti
-/// - Linux:   Noto Sans CJK / WenQuanYi / Droid Sans Fallback
+/// 采用「内嵌 gzip 压缩的文泉驿微米黑（OFL 自由许可，可随程序分发）」：
+/// - 字体以 gzip 压缩形式 `include_bytes!` 进 exe（assets/fonts/wqy-microhei.ttc.gz，2.3MB），
+///   运行时用 flate2 解压。相比「运行时读系统字体」的旧方案（Windows msyh / macOS PingFang /
+///   Linux Noto CJK），可以彻底摆脱对系统装没装中文字体的依赖，三平台开箱即用；
+///   比直接内嵌原始 .ttc（5.0MB）省约 2.7MB（压缩率 ~54%）。
+/// - 代价：启动时一次性解压 2.3MB（毫秒级，用户无感）；exe 体积 2.9MB → ~5MB。
 ///
 /// 注意：项目已关闭 egui 的 default_fonts feature（编译期不再嵌入 4 个内置字体
-/// 以压缩体积），因此这里必须成功加载至少一种字体，否则界面完全无字形。
-/// 中文字体（微软雅黑/苹方/Noto CJK）自带完整拉丁字形，可同时覆盖英文；
-/// 若中途找不到，退而加载系统英文字体兜底，保证英文界面可用。
+/// 以压缩体积），因此这里必须成功加载字体，否则界面完全无字形。
 fn install_chinese_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 各平台候选字体（按优先级）：先中文字体（含拉丁字形），后英文字体兜底
-    let (win, mac, linux): (&[&str], &[&str], &[&str]) = (
-        &[
-            "C:/Windows/Fonts/msyh.ttc",
-            "C:/Windows/Fonts/msyh.ttf",
-            "C:/Windows/Fonts/simhei.ttf",
-            "C:/Windows/Fonts/simsun.ttc",
-            "C:/Windows/Fonts/simkai.ttf",
-            "C:/Windows/Fonts/segoeui.ttf", // 英文兜底
-            "C:/Windows/Fonts/arial.ttf",
-        ],
-        &[
-            "/System/Library/Fonts/PingFang.ttc",           // 苹方
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/Library/Fonts/Arial Unicode.ttf",
-            "/System/Library/Fonts/STHeiti Light.ttc",
-            "/System/Library/Fonts/STHeiti Medium.ttc",
-            "/System/Library/Fonts/Helvetica.ttc",          // 英文兜底
-        ],
-        &[
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // 英文兜底
-        ],
-    );
+    // 内嵌的 gzip 压缩字体（编译期嵌入 exe）
+    let compressed: &[u8] = include_bytes!("../assets/fonts/wqy-microhei.ttc.gz");
 
-    // 当前平台：运行时用 cfg!(target_os) 决定
-    let candidates: &[&str] = if cfg!(target_os = "windows") {
-        win
-    } else if cfg!(target_os = "macos") {
-        mac
-    } else {
-        linux
+    // 解压 gzip → 原始 .ttc 字节
+    let installed = {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(compressed);
+        let mut bytes: Vec<u8> = Vec::with_capacity(compressed.len() * 2);
+        if decoder.read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+            let font_data = egui::FontData::from_owned(bytes);
+            fonts.font_data.insert("main".to_owned(), font_data.into());
+            true
+        } else {
+            false
+        }
     };
 
-    // 找到的第一个可用字体作为主字体（优先中文；中文缺失时英文兜底）
-    let mut installed = false;
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            let font_data = egui::FontData::from_owned(bytes);
-            // 注意：不再加 y_offset_factor（那会让按钮文字整体偏上，
-            // 导致“按钮文字没居中”感）。中文与英文基线差异交给字形自身。
-            fonts.font_data.insert("main".to_owned(), font_data.into());
-            installed = true;
-            break;
-        }
-    }
-
-    // 主字体缺失：这里必须显式返回并 popup 提示，否则界面无字形
+    // 字体缺失：这里必须显式返回并提示，否则界面无字形
     if !installed {
-        eprintln!("[PowerRename] 未找到任何系统字体，界面将无法正常显示文本");
+        eprintln!("[PowerRename] 内嵌字体解压失败，界面将无法正常显示文本");
         return;
     }
 

@@ -21,6 +21,7 @@ encoding_rs = "0.8"
 eframe = { version = "0.31", default-features = false, features = ["glow", "wayland", "x11"] }
 egui_extras = "0.31"
 rfd = "0.15"
+flate2 = "1"
 
 [profile.release]
 lto = true
