@@ -218,6 +218,8 @@ struct RenameApp {
     selected_preview: Option<std::path::PathBuf>,
     /// 预览区缩放倍率（Ctrl+滚轮，0.5~2.0，仅作用于预览表格）
     preview_zoom: f32,
+    /// 预览区状态筛选（None = 全部显示；Some(status) = 只显示该状态的节点）
+    preview_filter: Option<PreviewStatus>,
     /// 清单映射查看窗口（存规则序号，None=关闭）
     mapping_view: Option<usize>,
     status_msg: String,
@@ -256,6 +258,7 @@ impl RenameApp {
             expanded: std::collections::HashSet::new(),
             selected_preview: None,
             preview_zoom: 1.0,
+            preview_filter: None,
             mapping_view: None,
             status_msg: String::new(),
             undo: UndoManager::new(),
@@ -845,7 +848,48 @@ impl eframe::App for RenameApp {
                     }
                 }
                 // 预览框右上角：显示当前缩放比例（固定字号，不随预览缩放、不抢注意）
+                // 左侧：状态筛选按钮（计数实时从 preview_by_path 统计）
+                let filter = self.preview_filter;
+                let counts = {
+                    let mut c = [0usize; 5]; // [全部, Ok, Unchanged, Conflict, Error]
+                    c[0] = self.preview_by_path.len();
+                    for r in self.preview_by_path.values() {
+                        match r.status {
+                            PreviewStatus::Ok => c[1] += 1,
+                            PreviewStatus::Unchanged => c[2] += 1,
+                            PreviewStatus::Conflict => c[3] += 1,
+                            PreviewStatus::Error => c[4] += 1,
+                        }
+                    }
+                    c
+                };
+                // 筛选按钮：全部/就绪/无变化/冲突/错误（None=全部）。单击切换、再点取消；
+                // 计数为 0 的按钮禁用（「全部」恒可用）。选中态用 Button::selected 高亮。
+                let mut new_filter = filter;
                 ui.horizontal(|ui| {
+                    let mut btn = |ui: &mut egui::Ui, label: &str, st: Option<PreviewStatus>, cnt: usize| {
+                        let sel = filter == st;
+                        if cnt == 0 && st.is_some() {
+                            return; // 该状态无条目，不显示按钮（「全部」恒显示）
+                        }
+                        let text = if sel {
+                            egui::RichText::new(format!("{label} {cnt}"))
+                                .strong()
+                                .color(egui::Color32::WHITE)
+                        } else {
+                            egui::RichText::new(format!("{label} {cnt}"))
+                        };
+                        let resp = ui.add(egui::Button::new(text).selected(sel).small());
+                        if resp.clicked() {
+                            new_filter = if sel { None } else { st };
+                        }
+                    };
+                    btn(ui, "全部", None, counts[0]);
+                    ui.separator();
+                    btn(ui, "就绪", Some(PreviewStatus::Ok), counts[1]);
+                    btn(ui, "无变化", Some(PreviewStatus::Unchanged), counts[2]);
+                    btn(ui, "冲突", Some(PreviewStatus::Conflict), counts[3]);
+                    btn(ui, "错误", Some(PreviewStatus::Error), counts[4]);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("缩放 {}%", (zoom * 100.0).round() as i32))
@@ -854,6 +898,35 @@ impl eframe::App for RenameApp {
                         );
                     });
                 });
+                // 应用到 self（避免水平闭包内可变借用冲突）
+                self.preview_filter = new_filter;
+
+                // 树感知过滤：收集命中路径 → 向父目录逐级扩散（祖先链）
+                // 目录行在筛选中显示 = 自身命中 或 子树有命中；命中目录自动展开
+                let filter = self.preview_filter;
+                let mut subtree_hit: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+                if let Some(f) = filter {
+                    subtree_hit.extend(
+                        self.preview_by_path
+                            .iter()
+                            .filter(|(_, r)| r.status == f)
+                            .map(|(p, _)| p.clone()),
+                    );
+                    // 逐级向父目录扩散：祖先链上的目录都会被标记为「子树有命中」
+                    let mut changed = true;
+                    while changed {
+                        changed = false;
+                        for p in subtree_hit.clone() {
+                            if let Some(parent) = p.parent() {
+                                if parent != p && subtree_hit.insert(parent.to_path_buf()) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    // 命中目录自动展开祖先链，确保筛选结果可见
+                    self.expanded.extend(subtree_hit.iter().filter(|p| p.is_dir()).cloned());
+                }
                 // 多列表格：当前名称（树形缩进）/ 新名称 / 状态 / 说明
                 // 包一层双向滚动区：列总宽超过面板宽度时可左右滚动
                 use egui_extras::{Column, TableBuilder};
@@ -898,7 +971,7 @@ impl eframe::App for RenameApp {
                             })
                             .body(|mut body| {
                                 // 根目录恒可见（且默认展开）；子节点仅当其父目录展开时才渲染
-                                render_tree_rows(&mut body, tree, &self.preview_by_path, &mut self.expanded, &mut action, &mut self.selected_preview, zoom, true, true, 0);
+                                render_tree_rows(&mut body, tree, &self.preview_by_path, &mut self.expanded, &mut action, &mut self.selected_preview, zoom, true, true, 0, filter, &subtree_hit);
                                 if tree.children.is_empty() {
                                     body.row(26.0 * zoom, |mut row| {
                                         row.col(|ui| {
@@ -1054,12 +1127,22 @@ fn render_tree_rows(
     visible: bool,
     default_open: bool,
     depth: usize,
+    filter: Option<PreviewStatus>,
+    subtree_hit: &std::collections::HashSet<std::path::PathBuf>,
 ) {
     if !visible {
         return;
     }
 
     if node.is_dir {
+        // 状态筛选：目录行命中 = 自身是目标状态 或 子树里有目标状态。
+        // 未命中的目录整行隐藏（其子节点也随递归一并隐藏），保持树的层级语义。
+        if let Some(f) = filter {
+            let self_hit = by_path.get(&node.path).map(|r| r.status == f).unwrap_or(false);
+            if !self_hit && !subtree_hit.contains(&node.path) {
+                return;
+            }
+        }
         let is_open = expanded.contains(&node.path) || default_open;
         // 目录行的新名/状态/说明：勾选「包含文件夹」且目录可改名时，
         // preview_by_path 中会有该目录的预览结果，此时后三列与文件行一致显示；
@@ -1175,7 +1258,7 @@ fn render_tree_rows(
         });
         if is_open {
             for child in &node.children {
-                render_tree_rows(body, child, by_path, expanded, action, selected_preview, zoom, true, false, depth + 1);
+                render_tree_rows(body, child, by_path, expanded, action, selected_preview, zoom, true, false, depth + 1, filter, subtree_hit);
             }
         }
         return;
@@ -1183,6 +1266,12 @@ fn render_tree_rows(
 
     // 文件行
     let row_info = by_path.get(&node.path);
+    // 状态筛选：文件行命中 = 参与改名（跳过行一律隐藏）且状态匹配目标
+    if let Some(f) = filter {
+        if row_info.map(|r| r.status == f).unwrap_or(false) != true {
+            return;
+        }
+    }
     // 不在预览映射 → 该节点被筛选跳过（不可改名），显示「跳过」标签
     let is_skipped = row_info.is_none();
     let (new_name, status, note) = match row_info {
