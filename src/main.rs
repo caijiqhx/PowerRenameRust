@@ -224,6 +224,8 @@ struct RenameApp {
     mapping_view: Option<usize>,
     /// 预览统计信息（共 x 节点 | 可改名 x ...），显示在顶部面板
     preview_stats: String,
+    /// 深色模式开关（false=浅色；切主题时重建 visuals）
+    dark: bool,
     status_msg: String,
     undo: UndoManager,
     /// 截图钩子（仅供验收）：PR_CAPTURE 指向输出路径时，启动后自截图一帧 BMP 并退出
@@ -263,6 +265,7 @@ impl RenameApp {
             preview_filter: None,
             mapping_view: None,
             preview_stats: String::new(),
+            dark: false,
             status_msg: String::new(),
             undo: UndoManager::new(),
             capture_path,
@@ -496,7 +499,7 @@ impl RenameApp {
 
 impl eframe::App for RenameApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("top").frame(panel_frame()).show(ctx, |ui| {
+        egui::TopBottomPanel::top("top").frame(panel_frame(ctx)).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("目录：");
                 ui.add(
@@ -520,6 +523,13 @@ impl eframe::App for RenameApp {
                 if ui.button("导入清单").clicked() {
                     self.import_list();
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 深浅主题切换（放在行尾最右；不用 emoji（内嵌字体无字形会显示为方框））
+                    if ui.button("主题").clicked() {
+                        self.dark = !self.dark;
+                        install_theme(ctx, self.dark);
+                    }
+                });
             });
             ui.horizontal(|ui| {
                 let mut opts_changed = false;
@@ -549,13 +559,13 @@ impl eframe::App for RenameApp {
         });
 
         // 底部状态栏（应用/撤销按钮已移至规则面板）
-        egui::TopBottomPanel::bottom("bottom").frame(panel_frame()).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("bottom").frame(panel_frame(ctx)).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status_msg);
             });
         });
 
-        egui::SidePanel::left("rules").resizable(true).default_width(300.0).frame(panel_frame()).show(ctx, |ui| {
+        egui::SidePanel::left("rules").resizable(true).default_width(300.0).frame(panel_frame(ctx)).show(ctx, |ui| {
             // 添加规则：单个下拉菜单收拢全部 9 种规则（不再占三行按钮）
             ui.horizontal_wrapped(|ui| {
                 ui.menu_button("+ 添加规则", |ui| {
@@ -807,7 +817,7 @@ impl eframe::App for RenameApp {
             } else if self.rules.is_empty() {
                 // 无规则：居中大字水印（替代原「（还没有规则）」提示）
                 ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("规则").size(48.0).color(egui::Color32::from_gray(0xBB)));
+                    ui.label(egui::RichText::new("规则").size(48.0).color(watermark_color(ui)));
                 });
                 ui.add_space(12.0);
             } else {
@@ -818,7 +828,7 @@ impl eframe::App for RenameApp {
         // 预览右键菜单待执行动作（渲染时收集，面板结束后统一处理）
         let mut action: PreviewAction = PreviewAction::None;
 
-        egui::CentralPanel::default().frame(panel_frame()).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(panel_frame(ctx)).show(ctx, |ui| {
             if let Some(tree) = &self.tree {
                 // ---- 预览区 Ctrl+滚轮缩放：只作用于预览表格（字号/行高/列宽/缩进） ----
                 // 鼠标须在预览区上方才响应（避免缩放规则面板以外的区域）；滚动事件自带 ctrl 修饰时
@@ -981,7 +991,7 @@ impl eframe::App for RenameApp {
                             })
                             .body(|mut body| {
                                 // 根目录恒可见（且默认展开）；子节点仅当其父目录展开时才渲染
-                                render_tree_rows(&mut body, tree, &self.preview_by_path, &mut self.expanded, &mut action, &mut self.selected_preview, zoom, true, true, 0, filter, &subtree_hit);
+                                render_tree_rows(&mut body, tree, &self.preview_by_path, &mut self.expanded, &mut action, &mut self.selected_preview, zoom, true, true, 0, filter, &subtree_hit, self.dark);
                                 if tree.children.is_empty() {
                                     body.row(26.0 * zoom, |mut row| {
                                         row.col(|ui| {
@@ -997,7 +1007,7 @@ impl eframe::App for RenameApp {
             } else {
                 // 未加载目录：居中大字水印
                 ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("预览").size(60.0).color(egui::Color32::from_gray(0xBB)));
+                    ui.label(egui::RichText::new("预览").size(60.0).color(watermark_color(ui)));
                 });
             }
         });
@@ -1154,24 +1164,38 @@ fn diff_chars(old: &str, new: &str) -> Vec<(DiffKind, char)> {
 }
 
 /// 生成 diff 高亮 LayoutJob：旧名删除段红色+删除线，新名新增段绿色、保留段默认色。
-/// 只有 old != new 时高亮（无变化/跳过行走普通 label，避免渲染噪音）。
-fn diff_layout_job(old: &str, new: &str) -> Option<egui::text::LayoutJob> {
+/// 只有 old != new 时高亮（无变化/跳过行走普通 label，避免渲染噪音）。dark 控制新增段样式。
+fn diff_layout_job(old: &str, new: &str, dark: bool) -> Option<egui::text::LayoutJob> {
     if old == new {
         return None;
     }
+    // 深浅各一套：深色下新增段用淡绿文字+半透明白描边（绿底在深色下刺眼）
+    let (del_c, ins_c, ins_bg): (egui::Color32, egui::Color32, Option<egui::Color32>) = if dark {
+        (
+            egui::Color32::from_rgb(0xE0, 0x7A, 0x7A),
+            egui::Color32::from_rgb(0x81, 0xC7, 0x84),
+            Some(egui::Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x18)),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(0xcc, 0x4a, 0x4a),
+            egui::Color32::from_rgb(0x2e, 0x8b, 0x57),
+            Some(egui::Color32::from_rgb(0xdc, 0xf0, 0xe2)),
+        )
+    };
     let mut job = egui::text::LayoutJob::default();
     for (kind, c) in diff_chars(old, new) {
         let text = c.to_string();
         let fmt = match kind {
             DiffKind::Equal => egui::TextFormat::default(),
             DiffKind::Del => egui::TextFormat {
-                color: egui::Color32::from_rgb(0xcc, 0x4a, 0x4a),
-                strikethrough: egui::Stroke::new(1.0, egui::Color32::from_rgb(0xcc, 0x4a, 0x4a)),
+                color: del_c,
+                strikethrough: egui::Stroke::new(1.0, del_c),
                 ..Default::default()
             },
             DiffKind::Ins => egui::TextFormat {
-                color: egui::Color32::from_rgb(0x2e, 0x8b, 0x57),
-                background: egui::Color32::from_rgb(0xdc, 0xf0, 0xe2),
+                color: ins_c,
+                background: ins_bg.unwrap_or(egui::Color32::TRANSPARENT),
                 ..Default::default()
             },
         };
@@ -1251,20 +1275,64 @@ mod diff_tests {
 /// 文件行：双击 → 打开所在文件夹并定位文件。
 /// 表头右键 → 刷新预览。
 
-/// 自绘整行 hover 背景：指针悬停在 cell 内 → 画淡蓝填充（与选中同色系、更浅）。
-/// 每格各画自己的区域（与 striped/selected 同款 expand2 无缝拼接），拼合即整行；
-/// 即时按指针位置判断，无延迟、不走官方 hover 的延迟帧缓存（官方通道为灰色且不稳定）。
-/// 已选中行不再叠加 hover（保持完整蓝条）。
+/// 自绘整行 hover 背景：深色下用深蓝灰，浅色下淡蓝。
 fn paint_row_hover(ui: &egui::Ui, is_selected: bool) {
     if is_selected || !ui.ctx().rect_contains_pointer(ui.layer_id(), ui.max_rect()) {
         return;
     }
-    // 淡蓝 hover（≈ 主题 weak_bg_fill 0xD7E3F8 附近）；选中完整蓝条 0xCBDDF5 更深
+    let c = if ui.ctx().style().visuals.dark_mode {
+        egui::Color32::from_rgb(0x2A, 0x32, 0x3F)
+    } else {
+        egui::Color32::from_rgb(0xE0, 0xEB, 0xFA)
+    };
     ui.painter().rect_filled(
         ui.max_rect().expand2(0.5 * ui.spacing().item_spacing),
         egui::CornerRadius::ZERO,
-        egui::Color32::from_rgb(0xE0, 0xEB, 0xFA),
+        c,
     );
+}
+
+/// 空态水印颜色（大纲字，深色下更深避免刺眼）。
+fn watermark_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_gray(0x3C)
+    } else {
+        egui::Color32::from_gray(0xBB)
+    }
+}
+
+/// 状态 → 颜色（深浅两套；跳过行统一浅灰）。
+fn status_color(status: PreviewStatus, dark: bool) -> egui::Color32 {
+    match status {
+        PreviewStatus::Ok => {
+            if dark {
+                egui::Color32::from_rgb(0x81, 0xC7, 0x84)
+            } else {
+                egui::Color32::from_rgb(0x2e, 0x8b, 0x57)
+            }
+        }
+        PreviewStatus::Conflict => {
+            if dark {
+                egui::Color32::from_rgb(0xE5, 0x7A, 0x6B)
+            } else {
+                egui::Color32::from_rgb(0xc0, 0x39, 0x2b)
+            }
+        }
+        PreviewStatus::Error => {
+            if dark {
+                egui::Color32::from_rgb(0xFF, 0x8A, 0x80)
+            } else {
+                egui::Color32::from_rgb(0x8b, 0x00, 0x00)
+            }
+        }
+        PreviewStatus::Unchanged => {
+            if dark {
+                egui::Color32::from_rgb(0x8A, 0x8F, 0x98)
+            } else {
+                egui::Color32::GRAY
+            }
+        }
+    }
 }
 
 fn render_tree_rows(
@@ -1280,6 +1348,7 @@ fn render_tree_rows(
     depth: usize,
     filter: Option<PreviewStatus>,
     subtree_hit: &std::collections::HashSet<std::path::PathBuf>,
+    dark: bool,
 ) {
     if !visible {
         return;
@@ -1305,14 +1374,13 @@ fn render_tree_rows(
             None => (String::new(), PreviewStatus::Unchanged, String::new()),
         };
         let dir_color = if is_dir_skipped {
-            egui::Color32::from_rgb(0xA0, 0xA0, 0xA0) // 跳过（未参与改名）→ 浅灰
-        } else {
-            match dir_status {
-                PreviewStatus::Ok => egui::Color32::from_rgb(0x2e, 0x8b, 0x57),
-                PreviewStatus::Conflict => egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
-                PreviewStatus::Error => egui::Color32::from_rgb(0x8b, 0x00, 0x00),
-                PreviewStatus::Unchanged => egui::Color32::GRAY,
+            if dark {
+                egui::Color32::from_rgb(0x6A, 0x6F, 0x76) // 深色下跳过：深灰
+            } else {
+                egui::Color32::from_rgb(0xA0, 0xA0, 0xA0)
             }
+        } else {
+            status_color(dir_status, dark)
         };
         let dir_status_label = if is_dir_skipped {
             "跳过"
@@ -1340,13 +1408,18 @@ fn render_tree_rows(
                     // 尺寸随 zoom 缩放，保持与文字比例一致
                     let (tri_rect, tri_resp) = ui.allocate_exact_size(egui::vec2(12.0 * zoom, 12.0 * zoom), egui::Sense::click());
                     let painter = ui.painter();
+                    let (tri_hover_c, tri_hover_bg) = if ui.visuals().dark_mode {
+                        (egui::Color32::from_rgb(0x5B, 0x8D, 0xEF), egui::Color32::from_rgb(0x2A, 0x32, 0x3F))
+                    } else {
+                        (egui::Color32::from_rgb(0x2F, 0x6F, 0xD5), egui::Color32::from_rgb(0xE8, 0xF0, 0xFB))
+                    };
                     let tri_color = if tri_resp.hovered() {
-                        egui::Color32::from_rgb(0x2F, 0x6F, 0xD5) // 强调蓝：hover 高亮
+                        tri_hover_c // 强调蓝：hover 高亮
                     } else {
                         ui.visuals().text_color()
                     };
                     if tri_resp.hovered() {
-                        painter.rect_filled(tri_rect.expand2(egui::vec2(2.0, 1.0)), 2.0, egui::Color32::from_rgb(0xE8, 0xF0, 0xFB));
+                        painter.rect_filled(tri_rect.expand2(egui::vec2(2.0, 1.0)), 2.0, tri_hover_bg);
                     }
                     let c = tri_rect.center();
                     let s = 3.5 * zoom;
@@ -1389,7 +1462,7 @@ fn render_tree_rows(
                 // 目录新名称（参与改名时显示）
                 paint_row_hover(ui, is_selected);
                 if !is_dir_skipped {
-                    if let Some(job) = diff_layout_job(&node.name, &dir_new_name) {
+                    if let Some(job) = diff_layout_job(&node.name, &dir_new_name, ui.ctx().style().visuals.dark_mode) {
                         ui.label(job);
                     } else {
                         ui.colored_label(dir_color, dir_new_name);
@@ -1413,7 +1486,7 @@ fn render_tree_rows(
         });
         if is_open {
             for child in &node.children {
-                render_tree_rows(body, child, by_path, expanded, action, selected_preview, zoom, true, false, depth + 1, filter, subtree_hit);
+                render_tree_rows(body, child, by_path, expanded, action, selected_preview, zoom, true, false, depth + 1, filter, subtree_hit, dark);
             }
         }
         return;
@@ -1434,14 +1507,13 @@ fn render_tree_rows(
         None => (String::new(), PreviewStatus::Unchanged, String::new()),
     };
     let color = if is_skipped {
-        egui::Color32::from_rgb(0xA0, 0xA0, 0xA0) // 更浅的灰
-    } else {
-        match status {
-            PreviewStatus::Ok => egui::Color32::from_rgb(0x2e, 0x8b, 0x57),
-            PreviewStatus::Conflict => egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
-            PreviewStatus::Error => egui::Color32::from_rgb(0x8b, 0x00, 0x00),
-            PreviewStatus::Unchanged => egui::Color32::GRAY,
+        if dark {
+            egui::Color32::from_rgb(0x6A, 0x6F, 0x76) // 深色下跳过：深灰
+        } else {
+            egui::Color32::from_rgb(0xA0, 0xA0, 0xA0)
         }
+    } else {
+        status_color(status, dark)
     };
     let status_label = if is_skipped {
         "跳过"
@@ -1478,7 +1550,7 @@ fn render_tree_rows(
         row.col(|ui| {
             paint_row_hover(ui, is_selected);
             if !is_skipped {
-                if let Some(job) = diff_layout_job(&node.name, &new_name) {
+                if let Some(job) = diff_layout_job(&node.name, &new_name, ui.ctx().style().visuals.dark_mode) {
                     ui.label(job);
                 } else {
                     ui.colored_label(color, new_name);
@@ -1512,7 +1584,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             install_chinese_font(&cc.egui_ctx);
-            install_light_theme(&cc.egui_ctx);
+            install_theme(&cc.egui_ctx, false); // 默认浅色
             let mut app = RenameApp::new();
             if let Some(dir) = initial_dir.as_ref() {
                 app.dir_input = dir.clone();
@@ -1523,21 +1595,31 @@ fn main() -> eframe::Result {
     )
 }
 
-/// 安装定制的浅色主题：浅灰背景、白色面板、控件带边框、按钮有悬停/按下反馈。
-fn install_light_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::light();
+/// 安装定制主题（浅色/深色二选一）：统一背景、控件带边框、按钮有悬停/按下反馈。
+/// 字号定制与主题无关，在此一并设置。
+fn install_theme(ctx: &egui::Context, dark: bool) {
+    let mut visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
 
-    // 背景统一浅灰（面板/窗口/表格行都别纯白避免刺眼）；比之前再灰一档
-    let bg = egui::Color32::from_rgb(0xE5, 0xE6, 0xE9);
-    let bg_alt = egui::Color32::from_rgb(0xD9, 0xDB, 0xDF); // 表格交替行
+    // 背景统一（面板/窗口/表格行），深浅各一套
+    let (bg, bg_alt, border, accent): (egui::Color32, egui::Color32, egui::Color32, egui::Color32) = if dark {
+        (
+            egui::Color32::from_rgb(0x1E, 0x1F, 0x22), // 面板/窗口
+            egui::Color32::from_rgb(0x28, 0x29, 0x2D), // 表格交替行
+            egui::Color32::from_rgb(0x3A, 0x3D, 0x42), // 控件边框
+            egui::Color32::from_rgb(0x5B, 0x8D, 0xEF), // 强调蓝（深底更亮）
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(0xE5, 0xE6, 0xE9),
+            egui::Color32::from_rgb(0xD9, 0xDB, 0xDF),
+            egui::Color32::from_rgb(0xC2, 0xC6, 0xCA),
+            egui::Color32::from_rgb(0x2F, 0x6F, 0xD5),
+        )
+    };
     visuals.panel_fill = bg;
     visuals.window_fill = bg;
     visuals.extreme_bg_color = bg_alt;
     visuals.faint_bg_color = bg_alt; // TableBuilder striped 行
-
-    // 控件边框 + 圆角，让按钮/输入框有轮廓
-    let border = egui::Color32::from_rgb(0xC2, 0xC6, 0xCA);
-    let accent = egui::Color32::from_rgb(0x2F, 0x6F, 0xD5); // 蓝色强调
 
     for w in [
         &mut visuals.widgets.inactive,
@@ -1547,15 +1629,32 @@ fn install_light_theme(ctx: &egui::Context) {
         w.bg_stroke = egui::Stroke::new(1.0, border);
         w.corner_radius = egui::CornerRadius::same(4);
     }
-    // 按钮/控件：常态浅蓝底（区别于输入框白底），悬停加深、按下更深，突出可点击
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0xE9, 0xEF, 0xFA);
+
+    // 按钮/控件三态底色：浅色浅蓝底、深色暗底；悬停/按下加深，突出可点击
+    let (btn_bg, hover_bg, active_bg, selection): (egui::Color32, egui::Color32, egui::Color32, egui::Color32) =
+        if dark {
+            (
+                egui::Color32::from_rgb(0x2E, 0x30, 0x34),
+                egui::Color32::from_rgb(0x33, 0x36, 0x3B),
+                egui::Color32::from_rgb(0x3F, 0x44, 0x50),
+                egui::Color32::from_rgb(0x2A, 0x3A, 0x55),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(0xE9, 0xEF, 0xFA),
+                egui::Color32::from_rgb(0xD7, 0xE3, 0xF8),
+                egui::Color32::from_rgb(0xC3, 0xD6, 0xF2),
+                egui::Color32::from_rgb(0xCB, 0xDD, 0xF5),
+            )
+        };
+    visuals.widgets.inactive.bg_fill = btn_bg;
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.2, accent);
-    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0xD7, 0xE3, 0xF8);
+    visuals.widgets.hovered.weak_bg_fill = hover_bg;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, accent);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0xC3, 0xD6, 0xF2);
+    visuals.widgets.active.bg_fill = active_bg;
 
     // 选中项背景
-    visuals.selection.bg_fill = egui::Color32::from_rgb(0xCB, 0xDD, 0xF5);
+    visuals.selection.bg_fill = selection;
 
     // 按钮稍微加大：只调内边距（字号不变，文本仍按原字号渲染）
     ctx.style_mut(|style| {
@@ -1577,11 +1676,17 @@ fn install_light_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-/// 面板统一样式：接缝处微灰（与背景一致），内边距让内容不贴边。
-fn panel_frame() -> egui::Frame {
+/// 面板统一样式：接缝处与背景一致，内边距让内容不贴边。深浅色自动跟随当前主题。
+fn panel_frame(ctx: &egui::Context) -> egui::Frame {
+    let dark = ctx.style().visuals.dark_mode;
+    let (fill, stroke_c) = if dark {
+        (egui::Color32::from_rgb(0x1E, 0x1F, 0x22), egui::Color32::from_rgb(0x33, 0x36, 0x3B))
+    } else {
+        (egui::Color32::from_rgb(0xE5, 0xE6, 0xE9), egui::Color32::from_rgb(0xCC, 0xCF, 0xD3))
+    };
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0xE5, 0xE6, 0xE9))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xCC, 0xCF, 0xD3)))
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke_c))
         .inner_margin(egui::Margin::same(8))
         .corner_radius(egui::CornerRadius::same(0))
 }
